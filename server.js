@@ -1,123 +1,155 @@
 const { addonBuilder } = require('stremio-addon-sdk');
+const WebTorrent = require('webtorrent-hybrid');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const WebTorrent = require('webtorrent-hybrid');
 const express = require('express');
-const app = express();
+const cors = require('cors');
+
 const client = new WebTorrent();
+const app = express();
+app.use(cors());
 
-const PORT = process.env.PORT || 3000;
+const TRACKERS = [
+    'udp://tracker.openbittorrent.com:80',
+    'udp://tracker.opentrackr.org:1337',
+    'udp://tracker.internetwarriors.net:1337',
+    'udp://exodus.desync.com:6969',
+    'udp://tracker.leechers-paradise.org:6969',
+    'udp://tracker.coppersurfer.tk:6969',
+    'udp://9.rarbg.to:2710',
+    'udp://tracker.torrent.eu.org:451',
+    'udp://opentracker.i2p.rocks:6969',
+    'udp://tracker.moeking.me:6969',
+    'wss://tracker.btorrent.xyz',
+    'wss://tracker.openwebtorrent.com',
+    'wss://tracker.fastcast.nz',
+];
 
-///// 🟣 STREMIO MANIFEST
-const manifest = {
-    id: 'org.hackstore.remoteaddon',
-    version: '3.0.0',
-    name: 'Hackstore (Remote Stream)',
-    description: 'Latino movies & series scraped from Hackstore.fo + global magnet streaming',
-    resources: ['catalog', 'stream'],
-    types: ['movie', 'series'],
-    catalogs: [
-        { type: 'movie', id: 'hackstore_movies', name: 'Hackstore Movies' },
-        { type: 'series', id: 'hackstore_series', name: 'Hackstore Series' }
-    ],
-    idPrefixes: ['hackstore']
-};
+// ESPADA: Scrape Hackstore catalog and map IMDB IDs
+async function getCatalog() {
+    const url = 'https://www.hackstore.to/peliculas-latino/page/1/';
+    const resp = await axios.get(url);
+    const $ = cheerio.load(resp.data);
 
-const builder = new addonBuilder(manifest);
-
-///// 📚 CATALOG HANDLER
-builder.defineCatalogHandler(async ({ type, id }) => {
     const items = [];
-    const url = (type === 'movie')
-        ? 'https://hackstore.fo/peliculas/'
-        : 'https://hackstore.fo/series/';
 
-    const res = await axios.get(url);
-    const $ = cheerio.load(res.data);
-
-    $('.item').each((i, el) => {
-        const title = $(el).find('.title').text().trim();
+    $('.item_1.items').each((i, el) => {
+        const title = $(el).find('h2').text().trim();
         const poster = $(el).find('img').attr('src');
-        const pageUrl = $(el).find('a').attr('href');
+        const href = $(el).find('a').attr('href');
+        const slug = href.split('/').filter(Boolean).pop();
 
-        items.push({
-            id: `hackstore_${Buffer.from(pageUrl).toString('base64')}`,
-            name: title,
-            poster,
-        });
-    });
-
-    return { metas: items };
-});
-
-///// 📺 STREAM HANDLER
-builder.defineStreamHandler(async ({ id }) => {
-    const streams = [];
-
-    const pageUrl = Buffer.from(id.replace('hackstore_', ''), 'base64').toString('utf8');
-    const res = await axios.get(pageUrl);
-    const $ = cheerio.load(res.data);
-
-    $('a[href*="magnet:"], a[href*=".mp4"], a[href*=".mkv"]').each((i, el) => {
-        const link = $(el).attr('href');
-
-        if (link.startsWith('magnet:')) {
-            streams.push({
-                title: 'Stream Magnet (WebTorrent)',
-                url: `${BASE_URL}/stream/${encodeURIComponent(link)}`,
-            });
-        } else {
-            streams.push({
-                title: 'Direct Link',
-                url: link,
+        // Extract IMDB ID from slug pattern (e.g., pelicula-gratis-latino-tt1234567)
+        const imdbMatch = slug.match(/(tt\d{7,8})/);
+        if (imdbMatch) {
+            const imdb = imdbMatch[1];
+            items.push({
+                id: imdb,
+                name: title,
+                poster: poster,
+                slug: slug
             });
         }
     });
 
-    return { streams };
-});
+    return items;
+}
 
-///// 🟢 ADDON HTTP INTERFACE
-app.get('/manifest.json', (req, res) => {
-    res.json(builder.getInterface().manifest);
-});
+// STREAM HANDLER: Use magnet from Hackstore
+app.get('/stream/:imdb_id', async (req, res) => {
+    const imdb_id = req.params.imdb_id;
+    const catalog = await getCatalog();
 
-app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
-    const resp = await builder.getInterface().get('/catalog', req.params, req.query);
-    res.json(resp);
-});
+    const movie = catalog.find(m => m.id === imdb_id);
+    if (!movie) return res.status(404).json({ error: 'Not found in Hackstore' });
 
-app.get('/stream/:type/:id/:extra?.json', async (req, res) => {
-    const resp = await builder.getInterface().get('/stream', req.params, req.query);
-    res.json(resp);
-});
+    // Fetch magnet from Hackstore page
+    const page = await axios.get(`https://www.hackstore.to/${movie.slug}`);
+    const $ = cheerio.load(page.data);
 
-///// 🎥 MAGNET STREAM ENDPOINT
-app.get('/stream/:magnet', (req, res) => {
-    const magnet = decodeURIComponent(req.params.magnet);
+    let magnet;
+    $('a[href^="magnet:?xt"]').each((i, el) => {
+        magnet = $(el).attr('href');
+    });
 
-    client.add(magnet, torrent => {
+    if (!magnet) return res.status(404).json({ error: 'Magnet not found' });
+
+    // Inject trackers
+    TRACKERS.forEach(tr => {
+        if (!magnet.includes(tr)) {
+            magnet += `&tr=${encodeURIComponent(tr)}`;
+        }
+    });
+
+    client.add(magnet, { announce: TRACKERS }, torrent => {
         const file = torrent.files.find(f => f.name.endsWith('.mp4') || f.name.endsWith('.mkv') || f.name.endsWith('.avi'));
-
-        if (!file) return res.status(404).send('No playable video found in torrent.');
-
-        res.writeHead(200, {
-            'Content-Type': 'video/mp4',
-        });
-
-        const stream = file.createReadStream();
-        stream.pipe(res);
-
-        res.on('close', () => {
-            torrent.destroy();
-        });
+        res.setHeader('Content-Disposition', `inline; filename="${file.name}"`);
+        file.createReadStream().pipe(res);
     });
 });
 
-///// 🚀 START SERVER
-app.listen(PORT, () => {
-    console.log(`Hackstore remote addon running on port ${PORT}`);
+// STREMIO ADDON: Catalog & Streams
+const builder = new addonBuilder({
+    id: 'org.espada.hackstore',
+    version: '1.0.0',
+    name: 'Hackstore Espada',
+    catalogs: [
+        {
+            type: 'movie',
+            id: 'hackstore',
+            name: 'Hackstore Latinos',
+            extra: [{ name: 'search' }]
+        }
+    ],
+    resources: ['catalog', 'stream'],
+    types: ['movie'],
 });
 
-///// 🌐 BASE URL (auto detect or default)
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+builder.defineCatalogHandler(async ({ type, id, extra }) => {
+    if (id !== 'hackstore') return { metas: [] };
+
+    const catalog = await getCatalog();
+
+    // Search support
+    let metas = catalog.map(m => ({
+        id: m.id,
+        type: 'movie',
+        name: m.name,
+        poster: m.poster
+    }));
+
+    if (extra.search) {
+        const query = extra.search.toLowerCase();
+        metas = metas.filter(m => m.name.toLowerCase().includes(query));
+    }
+
+    return { metas };
+});
+
+builder.defineStreamHandler(async ({ type, id }) => {
+    return {
+        streams: [{
+            title: "Hackstore Magnet Stream",
+            url: `https://<your-fly-app>.fly.dev/stream/${id}`
+        }]
+    };
+});
+
+app.get('/manifest.json', (req, res) => {
+    res.json(builder.getInterface().getManifest());
+});
+
+app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
+    const { type, id } = req.params;
+    const extra = req.query || {};
+    const resp = await builder.getInterface().getCatalog({ type, id, extra });
+    res.json(resp);
+});
+
+app.get('/stream/:type/:id.json', async (req, res) => {
+    const { type, id } = req.params;
+    const resp = await builder.getInterface().getStream({ type, id });
+    res.json(resp);
+});
+
+app.listen(7000, () => console.log('🩸 Hackstore Espada Addon running on port 7000'));
