@@ -1,0 +1,1 @@
+# hackstore-stremio-add-on
